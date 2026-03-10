@@ -8,6 +8,7 @@ from extensions import db, cors, SWAGGER_CONFIG, SWAGGER_TEMPLATE
 
 def create_app(env='development'):
     app = Flask(__name__)
+    app.url_map.strict_slashes = False
     app.config.from_object(config[env])
 
     # ── Init Extensions ───────────────────────────────────────

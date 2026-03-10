@@ -1,30 +1,89 @@
 """
-routes/satellite_routes.py
----------------------------
-Satellite & Google Earth Engine (GEE) endpoints.
-Fetches fresh imagery, indices, and stores results in PostGIS DB.
+routes/satellite_routes.py — NDVI, SAVI, NDWI, LAI
 """
 from flask import Blueprint, request, jsonify
 from datetime import date, datetime, timedelta
 from extensions import db
 from core.models import Farm, SatelliteImagery, NDVIReading, MoistureReading
 from gee_processing import GEEProcessor
-from sqlalchemy import func
+from sqlalchemy import func, distinct
 
 satellite_bp = Blueprint('satellite', __name__)
 gee = GEEProcessor()
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get_geometry(farm):
-    """Return GeoJSON geometry from farm model."""
     if farm.boundary:
         return db.session.scalar(func.ST_AsGeoJSON(farm.boundary))
     if farm.latitude and farm.longitude:
-        return {
-            'type': 'Point',
-            'coordinates': [float(farm.longitude), float(farm.latitude)]
-        }
+        return {'type': 'Point', 'coordinates': [float(farm.longitude), float(farm.latitude)]}
     return None
+
+def _interpret_ndvi(v):
+    if v is None: return {'status': 'unknown',   'color': '#9E9E9E', 'description': 'No data available'}
+    if v >= 0.6:  return {'status': 'excellent', 'color': '#1B5E20', 'description': 'Dense, healthy vegetation'}
+    if v >= 0.4:  return {'status': 'good',      'color': '#4CAF50', 'description': 'Good crop cover'}
+    if v >= 0.2:  return {'status': 'moderate',  'color': '#FFC107', 'description': 'Moderate vegetation — monitor closely'}
+    if v >= 0.0:  return {'status': 'sparse',    'color': '#FF9800', 'description': 'Sparse vegetation or bare soil'}
+    return             {'status': 'stressed',  'color': '#F44336', 'description': 'Stressed or no vegetation'}
+
+def _interpret_savi(v):
+    if v is None: return {'status': 'unknown', 'color': '#9E9E9E', 'description': 'No data'}
+    if v >= 0.5:  return {'status': 'high',    'color': '#2E7D32', 'description': 'Dense canopy — good soil cover'}
+    if v >= 0.3:  return {'status': 'medium',  'color': '#8BC34A', 'description': 'Moderate vegetation with soil influence'}
+    if v >= 0.1:  return {'status': 'low',     'color': '#FFEB3B', 'description': 'Sparse crop — soil dominates signal'}
+    return             {'status': 'bare',    'color': '#FF7043', 'description': 'Bare or very sparse soil'}
+
+def _interpret_ndwi(v):
+    if v is None: return {'status': 'unknown',  'color': '#9E9E9E', 'description': 'No data'}
+    if v >= 0.3:  return {'status': 'high',     'color': '#0277BD', 'description': 'High leaf water — well irrigated'}
+    if v >= 0.1:  return {'status': 'adequate', 'color': '#29B6F6', 'description': 'Adequate leaf moisture'}
+    if v >= -0.1: return {'status': 'low',      'color': '#FFA726', 'description': 'Low leaf water — irrigation advised'}
+    return              {'status': 'dry',      'color': '#D32F2F', 'description': 'Severe water stress'}
+
+def _interpret_lai(v):
+    if v is None: return {'status': 'unknown', 'color': '#9E9E9E', 'description': 'No data'}
+    if v >= 4.0:  return {'status': 'dense',   'color': '#1B5E20', 'description': 'Dense canopy — excellent leaf coverage'}
+    if v >= 2.0:  return {'status': 'good',    'color': '#66BB6A', 'description': 'Good leaf area development'}
+    if v >= 1.0:  return {'status': 'sparse',  'color': '#FFCA28', 'description': 'Sparse canopy — early growth or stress'}
+    return             {'status': 'poor',    'color': '#EF5350', 'description': 'Very low leaf area — check crop health'}
+
+def _compute_indices(raw):
+    try:
+        nir   = raw.get('B8')
+        red   = raw.get('B4')
+        green = raw.get('B3')
+        ndvi  = (nir - red) / (nir + red + 1e-10) if nir and red else raw.get('ndvi')
+        savi  = (1.5 * (nir - red)) / (nir + red + 0.5 + 1e-10) if nir and red else raw.get('savi')
+        ndwi  = (green - nir) / (green + nir + 1e-10) if green and nir else raw.get('ndwi')
+        lai   = max(0, 3.618 * (ndvi ** 2) + 0.118) if ndvi is not None else raw.get('lai')
+        return {
+            'ndvi': round(float(ndvi), 4) if ndvi is not None else None,
+            'savi': round(float(savi), 4) if savi is not None else None,
+            'ndwi': round(float(ndwi), 4) if ndwi is not None else None,
+            'lai':  round(float(lai),  3) if lai  is not None else None,
+        }
+    except Exception:
+        return {'ndvi': raw.get('ndvi'), 'savi': raw.get('savi'),
+                'ndwi': raw.get('ndwi'), 'lai':  raw.get('lai')}
+
+def _overall_assessment(ndvi, ndwi, lai):
+    issues, recs = [], []
+    if ndvi is not None and ndvi < 0.3:
+        issues.append('low vegetation cover')
+        recs.append('Check for pest damage or nutrient deficiency')
+    if ndwi is not None and ndwi < 0.0:
+        issues.append('water stress detected')
+        recs.append('Irrigate within 48 hours')
+    if lai is not None and lai < 1.5:
+        issues.append('thin canopy')
+        recs.append('Consider top-dressing with nitrogen fertiliser')
+    if not issues:
+        return {'status': 'good', 'summary': 'Crop performing well across all indicators.',
+                'recommendations': ['Continue current practices', 'Next assessment in 2 weeks']}
+    return {'status': 'attention', 'summary': f"Farm shows: {', '.join(issues)}.",
+            'recommendations': recs}
 
 
 # ── GET /api/satellite/farms/<id>/ndvi ───────────────────────────────────────
@@ -32,136 +91,46 @@ def _get_geometry(farm):
 @satellite_bp.route('/farms/<int:farm_id>/ndvi', methods=['GET'])
 def get_farm_ndvi(farm_id):
     """
-    Get Fresh NDVI from Google Earth Engine
+    Get NDVI Time Series from GEE
     ---
-    tags:
-      - Satellite
+    tags: [Satellite]
     parameters:
-      - name: farm_id
-        in: path
-        type: integer
-        required: true
-      - name: days
-        in: query
-        type: integer
-        default: 30
-        description: Number of days to look back for imagery
+      - {name: farm_id, in: path,  type: integer, required: true}
+      - {name: days,    in: query, type: integer,  default: 30}
     responses:
-      200:
-        description: Latest NDVI value with health interpretation
-      404:
-        description: Farm not found
+      200: {description: NDVI time series with interpretation}
+      404: {description: Farm not found}
     """
     try:
         farm = Farm.query.get(farm_id)
         if not farm:
             return jsonify({'success': False, 'error': 'Farm not found'}), 404
-
         days     = int(request.args.get('days', 30))
         geometry = _get_geometry(farm)
-
-        if not geometry:
-            return jsonify({'success': False, 'error': 'Farm has no spatial geometry. Add latitude/longitude first.'}), 400
-
-        # Fetch from GEE
-        ndvi_data    = gee.get_ndvi_time_series(geometry, days=days)
-        latest       = ndvi_data[-1] if ndvi_data else None
-        health_score = gee.calculate_health_score(latest['ndvi']) if latest else 0
-        health_status = gee.get_health_status(health_score) if latest else None
-
-        # Save to DB
-        if latest:
-            reading = NDVIReading(
-                farm_id      = farm_id,
-                date         = date.fromisoformat(latest['date']),
-                ndvi_value   = latest['ndvi'],
-                health_score = health_score,
-                status       = health_status['status'] if health_status else None,
-                source       = 'sentinel-2'
-            )
-            db.session.add(reading)
-            db.session.commit()
-
-        return jsonify({
-            'success':      True,
-            'farm_id':      farm_id,
-            'farm_name':    farm.name,
-            'source':       'Google Earth Engine / Sentinel-2',
-            'days_queried': days,
-            'latest_ndvi':  latest,
-            'health_score': health_score,
-            'health_status': health_status,
-            'time_series':  ndvi_data,
-            'total_images': len(ndvi_data),
-        })
-
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-# ── GET /api/satellite/farms/<id>/imagery ────────────────────────────────────
-
-@satellite_bp.route('/farms/<int:farm_id>/imagery', methods=['GET'])
-def get_farm_imagery(farm_id):
-    """
-    Get Latest Satellite Imagery Metadata
-    ---
-    tags:
-      - Satellite
-    parameters:
-      - name: farm_id
-        in: path
-        type: integer
-        required: true
-      - name: satellite
-        in: query
-        type: string
-        default: sentinel-2
-        description: sentinel-2 | landsat-8 | landsat-9
-    responses:
-      200:
-        description: Satellite imagery metadata for the farm
-      404:
-        description: Farm not found
-    """
-    try:
-        farm = Farm.query.get(farm_id)
-        if not farm:
-            return jsonify({'success': False, 'error': 'Farm not found'}), 404
-
-        satellite = request.args.get('satellite', 'sentinel-2')
-        geometry  = _get_geometry(farm)
-
         if not geometry:
             return jsonify({'success': False, 'error': 'Farm has no spatial geometry'}), 400
 
-        # Get imagery metadata from GEE
-        imagery_meta = gee.get_latest_imagery(geometry, satellite=satellite)
+        ndvi_data = gee.get_ndvi_time_series(geometry, days=days)
+        latest    = ndvi_data[-1] if ndvi_data else None
+        health_score  = gee.calculate_health_score(latest['ndvi']) if latest else 0
+        health_status = gee.get_health_status(health_score) if latest else None
 
-        # Save to satellite_imagery table
-        if imagery_meta:
-            record = SatelliteImagery(
-                farm_id       = farm_id,
-                date_acquired = date.fromisoformat(imagery_meta.get('date', str(date.today()))),
-                satellite     = satellite,
-                cloud_cover   = imagery_meta.get('cloud_cover'),
-                ndvi          = imagery_meta.get('ndvi'),
-                evi           = imagery_meta.get('evi'),
-                moisture_index= imagery_meta.get('moisture_index'),
-                raw_data      = imagery_meta,
-            )
-            db.session.add(record)
+        if latest:
+            db.session.add(NDVIReading(
+                farm_id=farm_id, date=date.fromisoformat(latest['date']),
+                ndvi_value=latest['ndvi'], health_score=health_score,
+                status=health_status['status'] if health_status else None, source='sentinel-2'
+            ))
             db.session.commit()
 
         return jsonify({
-            'success':   True,
-            'farm_id':   farm_id,
-            'farm_name': farm.name,
-            'satellite': satellite,
-            'imagery':   imagery_meta,
+            'success': True, 'farm_id': farm_id, 'farm_name': farm.name,
+            'source': 'GEE / Sentinel-2', 'days_queried': days,
+            'latest_ndvi': latest, 'health_score': health_score,
+            'health_status': health_status,
+            'interpretation': _interpret_ndvi(latest['ndvi'] if latest else None),
+            'time_series': ndvi_data, 'total_images': len(ndvi_data),
         })
-
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -172,79 +141,73 @@ def get_farm_imagery(farm_id):
 @satellite_bp.route('/farms/<int:farm_id>/indices', methods=['GET'])
 def get_farm_indices(farm_id):
     """
-    Get All Spectral Indices in One Call (NDVI + EVI + Moisture)
+    Get All Agricultural Indices: NDVI, SAVI, NDWI, LAI
     ---
-    tags:
-      - Satellite
+    tags: [Satellite]
+    description: >
+      Returns NDVI (crop vigor), SAVI (soil-adjusted for sparse crops),
+      NDWI (leaf water content), LAI (canopy density). Each includes
+      value, status, color, description, and recommended action.
     parameters:
-      - name: farm_id
-        in: path
-        type: integer
-        required: true
+      - {name: farm_id, in: path, type: integer, required: true}
     responses:
-      200:
-        description: NDVI, EVI, and soil moisture index from GEE in one response
-      404:
-        description: Farm not found
+      200: {description: All 4 indices with interpretations and overall assessment}
+      404: {description: Farm not found}
     """
     try:
         farm = Farm.query.get(farm_id)
         if not farm:
             return jsonify({'success': False, 'error': 'Farm not found'}), 404
-
         geometry = _get_geometry(farm)
         if not geometry:
             return jsonify({'success': False, 'error': 'Farm has no spatial geometry'}), 400
 
-        # Fetch all indices from GEE
-        latest_ndvi  = gee.get_latest_ndvi(geometry)
-        moisture_pct = gee.get_soil_moisture(geometry)
+        imagery_raw = gee.get_latest_imagery(geometry, satellite='sentinel-2')
+        computed    = _compute_indices(imagery_raw or {})
 
-        ndvi_val = latest_ndvi['ndvi'] if latest_ndvi else None
-        evi_val  = latest_ndvi.get('evi') if latest_ndvi else None
-
-        health_score  = gee.calculate_health_score(ndvi_val) if ndvi_val else 0
-        health_status = gee.get_health_status(health_score)
-        moisture_status = gee.get_moisture_status(moisture_pct)
-
-        # Save combined reading
-        record = SatelliteImagery(
-            farm_id        = farm_id,
-            date_acquired  = date.today(),
-            satellite      = 'sentinel-2',
-            ndvi           = ndvi_val,
-            evi            = evi_val,
-            moisture_index = moisture_pct,
-            raw_data       = {'ndvi': ndvi_val, 'evi': evi_val, 'moisture': moisture_pct},
-        )
-        db.session.add(record)
+        db.session.add(SatelliteImagery(
+            farm_id=farm_id, date_acquired=date.today(), satellite='sentinel-2',
+            ndvi=computed['ndvi'], raw_data={**computed, 'source': 'sentinel-2'},
+        ))
         db.session.commit()
 
         return jsonify({
             'success':   True,
             'farm_id':   farm_id,
             'farm_name': farm.name,
+            'crop_type': farm.crop_type,
             'date':      str(date.today()),
-            'source':    'Google Earth Engine / Sentinel-2',
+            'source':    'GEE / Sentinel-2',
             'indices': {
                 'ndvi': {
-                    'value':        ndvi_val,
-                    'health_score': health_score,
-                    'status':       health_status.get('status') if health_status else None,
-                    'description':  health_status.get('description') if health_status else None,
+                    'value': computed['ndvi'], 'name': 'Normalized Difference Vegetation Index',
+                    'unit': 'dimensionless (-1 to 1)', 'good_range': '0.4 – 0.9',
+                    'interpretation': _interpret_ndvi(computed['ndvi']),
+                    'use': 'Overall crop greenness and vigor',
                 },
-                'evi': {
-                    'value':       evi_val,
-                    'description': 'Enhanced Vegetation Index — less atmosphere-sensitive than NDVI',
+                'savi': {
+                    'value': computed['savi'], 'name': 'Soil-Adjusted Vegetation Index',
+                    'unit': 'dimensionless', 'good_range': '0.3 – 0.7',
+                    'interpretation': _interpret_savi(computed['savi']),
+                    'use': 'Better than NDVI for sparse or young crops where bare soil affects readings',
                 },
-                'soil_moisture': {
-                    'value':       moisture_pct,
-                    'status':      moisture_status.get('status') if moisture_status else None,
-                    'description': moisture_status.get('description') if moisture_status else None,
+                'ndwi': {
+                    'value': computed['ndwi'], 'name': 'Normalized Difference Water Index',
+                    'unit': 'dimensionless (-1 to 1)', 'good_range': '0.1 – 0.5',
+                    'interpretation': _interpret_ndwi(computed['ndwi']),
+                    'use': 'Leaf water content — early warning before visible wilting',
                 },
-            }
+                'lai': {
+                    'value': computed['lai'], 'name': 'Leaf Area Index',
+                    'unit': 'm² leaf / m² ground', 'good_range': '2.0 – 6.0',
+                    'interpretation': _interpret_lai(computed['lai']),
+                    'use': 'Canopy density — directly correlates with yield potential',
+                },
+            },
+            'overall_assessment': _overall_assessment(
+                computed['ndvi'], computed['ndwi'], computed['lai']
+            ),
         })
-
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -255,81 +218,54 @@ def get_farm_indices(farm_id):
 @satellite_bp.route('/farms/<int:farm_id>/refresh', methods=['POST'])
 def refresh_farm_data(farm_id):
     """
-    Trigger Manual GEE Data Refresh for a Farm
+    Trigger Manual GEE Data Refresh (All Indices)
     ---
-    tags:
-      - Satellite
+    tags: [Satellite]
     parameters:
-      - name: farm_id
-        in: path
-        type: integer
-        required: true
+      - {name: farm_id, in: path, type: integer, required: true}
     responses:
-      200:
-        description: Fresh data fetched and saved to DB
-      404:
-        description: Farm not found
+      200: {description: All indices refreshed}
     """
     try:
         farm = Farm.query.get(farm_id)
         if not farm:
             return jsonify({'success': False, 'error': 'Farm not found'}), 404
-
         geometry = _get_geometry(farm)
         if not geometry:
             return jsonify({'success': False, 'error': 'Farm has no spatial geometry'}), 400
 
-        results = {}
-
-        # 1. Refresh NDVI
-        ndvi_series  = gee.get_ndvi_time_series(geometry, days=30)
-        latest_ndvi  = ndvi_series[-1] if ndvi_series else None
+        ndvi_series = gee.get_ndvi_time_series(geometry, days=30)
+        latest_ndvi = ndvi_series[-1] if ndvi_series else None
         if latest_ndvi:
-            health_score = gee.calculate_health_score(latest_ndvi['ndvi'])
-            health_status = gee.get_health_status(health_score)
+            hs = gee.calculate_health_score(latest_ndvi['ndvi'])
             db.session.add(NDVIReading(
-                farm_id      = farm_id,
-                date         = date.fromisoformat(latest_ndvi['date']),
-                ndvi_value   = latest_ndvi['ndvi'],
-                health_score = health_score,
-                status       = health_status['status'] if health_status else None,
-                source       = 'sentinel-2'
+                farm_id=farm_id, date=date.fromisoformat(latest_ndvi['date']),
+                ndvi_value=latest_ndvi['ndvi'], health_score=hs, source='sentinel-2'
             ))
-            results['ndvi'] = {'value': latest_ndvi['ndvi'], 'health_score': health_score}
 
-        # 2. Refresh Moisture
-        moisture_pct    = gee.get_soil_moisture(geometry)
-        moisture_status = gee.get_moisture_status(moisture_pct)
+        imagery_raw  = gee.get_latest_imagery(geometry, satellite='sentinel-2')
+        computed     = _compute_indices(imagery_raw or {})
+        moisture_pct = gee.get_soil_moisture(geometry)
+        ms           = gee.get_moisture_status(moisture_pct)
+
         db.session.add(MoistureReading(
-            farm_id          = farm_id,
-            date             = date.today(),
-            moisture_percent = moisture_pct,
-            status           = moisture_status['status'] if moisture_status else None,
-            days_since_rain  = 0
+            farm_id=farm_id, date=date.today(),
+            moisture_percent=moisture_pct,
+            status=ms['status'] if ms else None, days_since_rain=0
         ))
-        results['moisture'] = {'value': moisture_pct, 'status': moisture_status.get('status')}
-
-        # 3. Save combined imagery record
         db.session.add(SatelliteImagery(
-            farm_id       = farm_id,
-            date_acquired = date.today(),
-            satellite     = 'sentinel-2',
-            ndvi          = latest_ndvi['ndvi'] if latest_ndvi else None,
-            moisture_index= moisture_pct,
-            raw_data      = results,
+            farm_id=farm_id, date_acquired=date.today(), satellite='sentinel-2',
+            ndvi=computed.get('ndvi'), moisture_index=moisture_pct,
+            raw_data={**computed, 'moisture': moisture_pct},
         ))
-
         db.session.commit()
 
         return jsonify({
-            'success':    True,
-            'farm_id':    farm_id,
-            'farm_name':  farm.name,
+            'success': True, 'farm_id': farm_id, 'farm_name': farm.name,
             'refreshed_at': datetime.utcnow().isoformat(),
-            'results':    results,
-            'message':    'Farm satellite data refreshed successfully',
+            'indices': computed, 'moisture': moisture_pct,
+            'message': 'All satellite indices refreshed successfully',
         })
-
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -340,56 +276,45 @@ def refresh_farm_data(farm_id):
 @satellite_bp.route('/farms/<int:farm_id>/history', methods=['GET'])
 def get_satellite_history(farm_id):
     """
-    Get Saved Satellite Imagery History from Database
+    Historical Satellite Index Readings
     ---
-    tags:
-      - Satellite
+    tags: [Satellite]
     parameters:
-      - name: farm_id
-        in: path
-        type: integer
-        required: true
-      - name: days
-        in: query
-        type: integer
-        default: 90
-      - name: satellite
-        in: query
-        type: string
-        description: Filter by satellite (sentinel-2, landsat-8)
+      - {name: farm_id, in: path,  type: integer, required: true}
+      - {name: days,    in: query, type: integer,  default: 90}
     responses:
-      200:
-        description: Historical satellite readings from DB
-      404:
-        description: Farm not found
+      200: {description: Historical readings including NDVI time series for charts}
     """
     try:
         farm = Farm.query.get(farm_id)
         if not farm:
             return jsonify({'success': False, 'error': 'Farm not found'}), 404
+        days  = int(request.args.get('days', 90))
+        since = date.today() - timedelta(days=days)
 
-        days      = int(request.args.get('days', 90))
-        satellite = request.args.get('satellite')
-        since     = date.today() - timedelta(days=days)
-
-        query = SatelliteImagery.query.filter(
-            SatelliteImagery.farm_id == farm_id,
+        records = SatelliteImagery.query.filter(
+            SatelliteImagery.farm_id >= farm_id,
             SatelliteImagery.date_acquired >= since
-        )
-        if satellite:
-            query = query.filter_by(satellite=satellite)
+        ).order_by(SatelliteImagery.date_acquired.desc()).all()
 
-        records = query.order_by(SatelliteImagery.date_acquired.desc()).all()
+        ndvi_readings = NDVIReading.query.filter(
+            NDVIReading.farm_id == farm_id,
+            NDVIReading.date    >= since
+        ).order_by(NDVIReading.date.asc()).all()
 
         return jsonify({
             'success':   True,
             'farm_id':   farm_id,
             'farm_name': farm.name,
             'days':      days,
-            'count':     len(records),
-            'history':   [r.to_dict() for r in records],
+            'imagery':   [r.to_dict() for r in records],
+            'ndvi_series': [
+                {'date': str(r.date), 'ndvi': float(r.ndvi_value) if r.ndvi_value else None,
+                 'health_score': r.health_score, 'status': r.status}
+                for r in ndvi_readings
+            ],
+            'count': len(records),
         })
-
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -399,34 +324,23 @@ def get_satellite_history(farm_id):
 @satellite_bp.route('/coverage', methods=['GET'])
 def get_coverage_summary():
     """
-    Get Satellite Data Coverage Summary Across All Farms
+    Satellite Coverage Summary
     ---
-    tags:
-      - Satellite
+    tags: [Satellite]
     responses:
-      200:
-        description: How many farms have recent satellite data
+      200: {description: Farms with recent satellite data}
     """
     try:
-        total_farms   = Farm.query.filter_by(status='active').count()
-        since_30_days = date.today() - timedelta(days=30)
-
-        farms_with_data = db.session.query(
-            SatelliteImagery.farm_id
-        ).filter(
-            SatelliteImagery.date_acquired >= since_30_days
-        ).distinct().count()
-
-        farms_without = total_farms - farms_with_data
-
+        total        = Farm.query.filter_by(status='active').count()
+        since_30     = date.today() - timedelta(days=30)
+        with_data    = db.session.query(SatelliteImagery.farm_id).filter(
+            SatelliteImagery.date_acquired >= since_30).distinct().count()
         return jsonify({
-            'success':           True,
-            'total_farms':       total_farms,
-            'farms_with_recent_data': farms_with_data,
-            'farms_without_data': farms_without,
-            'coverage_percent':  round((farms_with_data / total_farms * 100), 1) if total_farms else 0,
-            'data_window_days':  30,
+            'success': True, 'total_farms': total,
+            'farms_with_recent_data': with_data,
+            'farms_without_data': total - with_data,
+            'coverage_percent': round(with_data / total * 100, 1) if total else 0,
+            'data_window_days': 30,
         })
-
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
