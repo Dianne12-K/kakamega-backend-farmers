@@ -1,126 +1,88 @@
-from flask import Flask
-from flask_cors import CORS
-from flasgger import Swagger
-from config import Config
+"""
+app.py — GeoAI Platform App Factory
+"""
+from flask import Flask, jsonify
+from config import config
+from extensions import db, cors, SWAGGER_CONFIG, SWAGGER_TEMPLATE
 
-# Initialize Flask app
-app = Flask(__name__)
-CORS(app)
 
-# Swagger Configuration
-swagger_config = {
-    "headers": [],
-    "specs": [
-        {
-            "endpoint": 'apispec',
-            "route": '/apispec.json',
-            "rule_filter": lambda rule: True,
-            "model_filter": lambda tag: True,
-        }
-    ],
-    "static_url_path": "/flasgger_static",
-    "swagger_ui": True,
-    "specs_route": "/api/docs"
-}
+def create_app(env='development'):
+    app = Flask(__name__)
+    app.config.from_object(config[env])
 
-swagger_template = {
-    "info": {
-        "title": "Kakamega Farms Smart Monitoring API",
-        "description": "API for monitoring crop health, soil moisture, weather, and smart farming recommendations",
-        "version": "1.0.0",
-        "contact": {
-            "name": "Kakamega Farms",
-            "email": "info@kakamegafarms.ke"
-        }
-    },
-    "host": "127.0.0.1:5000",
-    "basePath": "/",
-    "schemes": ["http"],
-    "tags": [
-        {"name": "System", "description": "System health and info"},
-        {"name": "Farms", "description": "Farm management"},
-        {"name": "Sub-Counties", "description": "Sub-county management"},
-        {"name": "Wards", "description": "Ward management"},
-        {"name": "Health", "description": "Crop health monitoring"},
-        {"name": "Weather", "description": "Weather forecast"},
-        {"name": "Recommendations", "description": "Smart farming recommendations"}
-    ]
-}
+    # ── Init Extensions ───────────────────────────────────────
+    db.init_app(app)
+    cors.init_app(app, resources={r"/api/*": {"origins": "*"}})
 
-swagger = Swagger(app, config=swagger_config, template=swagger_template)
+    app.config['SWAGGER'] = SWAGGER_CONFIG
+    from flasgger import Swagger as _Swagger
+    _Swagger(app, template=SWAGGER_TEMPLATE)
 
-# Import and register blueprints (routes)
-from routes.farm_routes import farm_bp
-from routes.health_routes import health_bp
-from routes.weather_routes import weather_bp
-from routes.recommendation_routes import recommendation_bp
-from routes.subcounty_routes import subcounty_bp
-from routes.ward_routes import ward_bp
+    # ── Register Blueprints ───────────────────────────────────
+    from routes.health_routes          import health_bp
+    from routes.farm_routes            import farm_bp
+    from routes.weather_routes         import weather_bp
+    from routes.market_routes          import market_bp
+    from routes.recommendation_routes  import recommendation_bp
+    from routes.subcounty_routes       import subcounty_bp
+    from routes.ward_routes            import ward_bp
+    from routes.satellite_routes       import satellite_bp
+    from routes.spatial_routes         import spatial_bp
+    from routes.analytics_routes       import analytics_bp
 
-app.register_blueprint(farm_bp)
-app.register_blueprint(health_bp)
-app.register_blueprint(weather_bp)
-app.register_blueprint(recommendation_bp)
-app.register_blueprint(subcounty_bp)
-app.register_blueprint(ward_bp)
+    app.register_blueprint(health_bp)
+    app.register_blueprint(farm_bp,           url_prefix='/api/farms')
+    app.register_blueprint(weather_bp,        url_prefix='/api/weather')
+    app.register_blueprint(market_bp,         url_prefix='/api/markets')
+    app.register_blueprint(recommendation_bp, url_prefix='/api/recommendations')
+    app.register_blueprint(subcounty_bp,      url_prefix='/api/subcounties')
+    app.register_blueprint(ward_bp,           url_prefix='/api/wards')
+    app.register_blueprint(satellite_bp,      url_prefix='/api/satellite')
+    app.register_blueprint(spatial_bp,        url_prefix='/api/spatial')
+    app.register_blueprint(analytics_bp,      url_prefix='/api/analytics')
 
-# Home route
-@app.route('/')
-def home():
-    """
-    API Health Check
-    ---
-    tags:
-      - System
-    responses:
-      200:
-        description: API status and endpoints
-    """
-    return {
-        'status': 'running',
-        'message': 'Kakamega Farms Smart Monitoring API',
-        'version': '1.0.0',
-        'documentation': '/api/docs',
-        'endpoints': {
-            'farms': '/api/farms',
-            'farm_detail': '/api/farms/<id>',
-            'subcounties': '/api/subcounties',
-            'subcounty_detail': '/api/subcounties/<id>',
-            'wards': '/api/wards',
-            'ward_detail': '/api/wards/<id>',
-            'health': '/api/farms/<id>/health',
-            'moisture': '/api/farms/<id>/moisture',
-            'weather': '/api/weather',
-            'recommendation': '/api/farms/<id>/recommendation',
-            'irrigation': '/api/farms/<id>/irrigation-schedule'
-        }
-    }
+    # ── Create DB Tables ──────────────────────────────────────
+    with app.app_context():
+        db.create_all()
 
-# Error handlers
-@app.errorhandler(404)
-def not_found(error):
-    return {'success': False, 'error': 'Endpoint not found'}, 404
+    # ── Root ──────────────────────────────────────────────────
+    @app.route('/')
+    def index():
+        return jsonify({
+            "name":          "Kakamega Smart Farm — GeoAI Platform",
+            "version":       "3.0.0",
+            "status":        "online",
+            "documentation": "/docs",
+            "database":      "PostgreSQL + PostGIS",
+            "endpoints": {
+                "farms":           "/api/farms",
+                "weather":         "/api/weather",
+                "markets":         "/api/markets",
+                "recommendations": "/api/recommendations",
+                "subcounties":     "/api/subcounties",
+                "wards":           "/api/wards",
+                "satellite":       "/api/satellite",
+                "spatial":         "/api/spatial",
+                "analytics":       "/api/analytics",
+                "docs":            "/docs",
+            }
+        })
 
-@app.errorhandler(500)
-def internal_error(error):
-    return {'success': False, 'error': 'Internal server error'}, 500
+    @app.errorhandler(404)
+    def not_found(e):
+        return jsonify({"error": "Resource not found", "status": 404}), 404
 
-# Run app
+    @app.errorhandler(500)
+    def server_error(e):
+        return jsonify({"error": "Internal server error", "status": 500}), 500
+
+    @app.errorhandler(400)
+    def bad_request(e):
+        return jsonify({"error": "Bad request", "status": 400}), 400
+
+    return app
+
+
 if __name__ == '__main__':
-    print("=" * 60)
-    print(" KAKAMEGA FARMS SMART MONITORING SYSTEM")
-    print("=" * 60)
-    print(f" Default Location: {Config.DEFAULT_LAT}, {Config.DEFAULT_LON}")
-    print(f"  Database: {Config.DATABASE_PATH}")
-    print(f"  Weather API: {'✓ Configured' if Config.OPENWEATHER_API_KEY else '✗ NOT CONFIGURED'}")
-    print(f"  Earth Engine: {'✓ Configured' if Config.GEE_PROJECT_ID else '✗ NOT CONFIGURED'}")
-    print(f" API Documentation: http://127.0.0.1:5000/api/docs")
-    print("=" * 60)
-    print(" New Endpoints Available:")
-    print("   • Sub-Counties: /api/subcounties")
-    print("   • Wards: /api/wards")
-    print("=" * 60)
-    print(" Starting server...")
-    print("=" * 60)
-
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app = create_app('development')
+    app.run(host='0.0.0.0', port=5000, debug=True)

@@ -1,7 +1,7 @@
 import sqlite3
 import json
 import os
-from datetime import datetime
+from datetime import datetime, date
 from config import Config
 
 
@@ -11,7 +11,7 @@ class Database:
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.init_db()
         self.update_schema()
-        self.create_indexes()  # Create indexes after schema updates
+        self.create_indexes()
 
     # ===== CONNECTION =====
 
@@ -121,6 +121,65 @@ class Database:
                            )
                        """)
 
+        # ===== NEW MARKET DATA TABLES =====
+
+        # Markets Table
+        cursor.execute("""
+                       CREATE TABLE IF NOT EXISTS markets (
+                                                              id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                              name TEXT NOT NULL,
+                                                              location TEXT,
+                                                              contact_phone TEXT,
+                                                              contact_person TEXT,
+                                                              operating_days TEXT,
+                                                              payment_terms TEXT,
+                                                              is_active INTEGER DEFAULT 1,
+                                                              created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                                                              updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                       )
+                       """)
+
+        # Market Prices Table
+        cursor.execute("""
+                       CREATE TABLE IF NOT EXISTS market_prices (
+                                                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                                    market_id INTEGER NOT NULL,
+                                                                    crop_type TEXT NOT NULL,
+                                                                    price REAL NOT NULL,
+                                                                    unit TEXT DEFAULT 'per 90kg bag',
+                                                                    grade TEXT,
+                                                                    date_recorded TEXT,
+                                                                    is_current INTEGER DEFAULT 1,
+                                                                    notes TEXT,
+                                                                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                                                                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                                                                    FOREIGN KEY (market_id) REFERENCES markets(id) ON DELETE CASCADE
+                           )
+                       """)
+
+        # Collection Centers Table
+        cursor.execute("""
+                       CREATE TABLE IF NOT EXISTS collection_centers (
+                                                                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                                         name TEXT NOT NULL,
+                                                                         location TEXT,
+                                                                         latitude REAL,
+                                                                         longitude REAL,
+                                                                         crops_accepted TEXT,
+                                                                         contact_phone TEXT,
+                                                                         contact_person TEXT,
+                                                                         operating_days TEXT,
+                                                                         operating_hours TEXT,
+                                                                         storage_capacity TEXT,
+                                                                         payment_terms TEXT,
+                                                                         minimum_quantity TEXT,
+                                                                         quality_requirements TEXT,
+                                                                         is_active INTEGER DEFAULT 1,
+                                                                         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                                                                         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                       )
+                       """)
+
         conn.commit()
         conn.close()
 
@@ -152,15 +211,19 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
 
-        try:
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_wards_subcounty ON wards(subcounty_id)")
-        except sqlite3.OperationalError:
-            pass
+        indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_wards_subcounty ON wards(subcounty_id)",
+            "CREATE INDEX IF NOT EXISTS idx_farms_ward ON farms(ward_id)",
+            "CREATE INDEX IF NOT EXISTS idx_market_prices_market ON market_prices(market_id)",
+            "CREATE INDEX IF NOT EXISTS idx_market_prices_crop ON market_prices(crop_type)",
+            "CREATE INDEX IF NOT EXISTS idx_market_prices_current ON market_prices(is_current)",
+        ]
 
-        try:
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_farms_ward ON farms(ward_id)")
-        except sqlite3.OperationalError:
-            pass
+        for index_sql in indexes:
+            try:
+                cursor.execute(index_sql)
+            except sqlite3.OperationalError:
+                pass
 
         conn.commit()
         conn.close()
@@ -565,3 +628,299 @@ class Database:
                 farm["boundary_geojson"] = json.loads(farm["boundary_geojson"])
 
         return farms
+
+    # ==========================================
+    # MARKET CRUD OPERATIONS
+    # ==========================================
+
+    def add_market(self, name, location=None, contact_phone=None, contact_person=None,
+                   operating_days=None, payment_terms=None):
+        """Add new market"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+                       INSERT INTO markets (name, location, contact_phone, contact_person,
+                                            operating_days, payment_terms)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       """, (name, location, contact_phone, contact_person, operating_days, payment_terms))
+        market_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return market_id
+
+    def get_all_markets(self, active_only=True):
+        """Get all markets"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if active_only:
+            cursor.execute("SELECT * FROM markets WHERE is_active = 1 ORDER BY name")
+        else:
+            cursor.execute("SELECT * FROM markets ORDER BY name")
+        markets = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return markets
+
+    def get_market(self, market_id):
+        """Get single market by ID"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM markets WHERE id = ?", (market_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def update_market(self, market_id, **kwargs):
+        """Update market with any fields"""
+        updates = []
+        params = []
+
+        for key, value in kwargs.items():
+            if value is not None:
+                updates.append(f"{key} = ?")
+                params.append(value)
+
+        if not updates:
+            return False
+
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(market_id)
+
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        query = f"UPDATE markets SET {', '.join(updates)} WHERE id = ?"
+        cursor.execute(query, tuple(params))
+        rows_affected = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return rows_affected > 0
+
+    def delete_market(self, market_id):
+        """Soft delete market (set is_active = 0)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+                       UPDATE markets SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+                       WHERE id = ?
+                       """, (market_id,))
+        rows_affected = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return rows_affected > 0
+
+    # ==========================================
+    # MARKET PRICE CRUD OPERATIONS
+    # ==========================================
+
+    def add_market_price(self, market_id, crop_type, price, unit='per 90kg bag',
+                         grade=None, date_recorded=None, notes=None):
+        """Add new market price"""
+        if date_recorded is None:
+            date_recorded = date.today().isoformat()
+
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        # Mark previous prices for this market/crop as not current
+        cursor.execute("""
+                       UPDATE market_prices SET is_current = 0
+                       WHERE market_id = ? AND crop_type = ? AND is_current = 1
+                       """, (market_id, crop_type))
+
+        # Insert new price
+        cursor.execute("""
+                       INSERT INTO market_prices (market_id, crop_type, price, unit, grade,
+                                                  date_recorded, notes)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       """, (market_id, crop_type, price, unit, grade, date_recorded, notes))
+
+        price_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return price_id
+
+    def get_market_prices_by_crop(self, crop_type, current_only=True):
+        """Get all prices for a specific crop"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        if current_only:
+            cursor.execute("""
+                           SELECT mp.*, m.name as market_name, m.location as market_location
+                           FROM market_prices mp
+                                    JOIN markets m ON mp.market_id = m.id
+                           WHERE mp.crop_type = ? AND mp.is_current = 1 AND m.is_active = 1
+                           ORDER BY mp.price DESC
+                           """, (crop_type,))
+        else:
+            cursor.execute("""
+                           SELECT mp.*, m.name as market_name, m.location as market_location
+                           FROM market_prices mp
+                                    JOIN markets m ON mp.market_id = m.id
+                           WHERE mp.crop_type = ? AND m.is_active = 1
+                           ORDER BY mp.date_recorded DESC
+                           """, (crop_type,))
+
+        prices = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return prices
+
+    def get_price_history(self, market_id, crop_type, days=30):
+        """Get price history for a market and crop"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+                       SELECT * FROM market_prices
+                       WHERE market_id = ? AND crop_type = ?
+                       ORDER BY date_recorded DESC
+                           LIMIT ?
+                       """, (market_id, crop_type, days))
+        prices = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return prices
+
+    def update_market_price(self, price_id, **kwargs):
+        """Update market price"""
+        updates = []
+        params = []
+
+        for key, value in kwargs.items():
+            if value is not None:
+                updates.append(f"{key} = ?")
+                params.append(value)
+
+        if not updates:
+            return False
+
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(price_id)
+
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        query = f"UPDATE market_prices SET {', '.join(updates)} WHERE id = ?"
+        cursor.execute(query, tuple(params))
+        rows_affected = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return rows_affected > 0
+
+    def delete_market_price(self, price_id):
+        """Delete market price"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM market_prices WHERE id = ?", (price_id,))
+        rows_affected = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return rows_affected > 0
+
+    # ==========================================
+    # COLLECTION CENTER CRUD OPERATIONS
+    # ==========================================
+
+    def add_collection_center(self, name, location=None, latitude=None, longitude=None,
+                              crops_accepted=None, contact_phone=None, contact_person=None,
+                              operating_days=None, operating_hours=None, storage_capacity=None,
+                              payment_terms=None, minimum_quantity=None, quality_requirements=None):
+        """Add new collection center"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        # Convert crops_accepted list to JSON string
+        crops_json = json.dumps(crops_accepted) if crops_accepted else None
+
+        cursor.execute("""
+                       INSERT INTO collection_centers (name, location, latitude, longitude,
+                                                       crops_accepted, contact_phone, contact_person, operating_days,
+                                                       operating_hours, storage_capacity, payment_terms, minimum_quantity,
+                                                       quality_requirements)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       """, (name, location, latitude, longitude, crops_json, contact_phone,
+                             contact_person, operating_days, operating_hours, storage_capacity,
+                             payment_terms, minimum_quantity, quality_requirements))
+
+        center_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return center_id
+
+    def get_all_collection_centers(self, active_only=True):
+        """Get all collection centers"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        if active_only:
+            cursor.execute("SELECT * FROM collection_centers WHERE is_active = 1 ORDER BY name")
+        else:
+            cursor.execute("SELECT * FROM collection_centers ORDER BY name")
+
+        centers = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+
+        # Parse JSON crops_accepted
+        for center in centers:
+            if center.get('crops_accepted'):
+                center['crops_accepted'] = json.loads(center['crops_accepted'])
+
+        return centers
+
+    def get_collection_center(self, center_id):
+        """Get single collection center by ID"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM collection_centers WHERE id = ?", (center_id,))
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            center = dict(row)
+            if center.get('crops_accepted'):
+                center['crops_accepted'] = json.loads(center['crops_accepted'])
+            return center
+        return None
+
+    def get_collection_centers_by_crop(self, crop_type, active_only=True):
+        """Get collection centers that accept a specific crop"""
+        centers = self.get_all_collection_centers(active_only)
+        filtered = [c for c in centers if crop_type.lower() in [crop.lower() for crop in (c.get('crops_accepted') or [])]]
+        return filtered
+
+    def update_collection_center(self, center_id, **kwargs):
+        """Update collection center"""
+        updates = []
+        params = []
+
+        for key, value in kwargs.items():
+            if value is not None:
+                # Handle crops_accepted list
+                if key == 'crops_accepted' and isinstance(value, list):
+                    value = json.dumps(value)
+                updates.append(f"{key} = ?")
+                params.append(value)
+
+        if not updates:
+            return False
+
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(center_id)
+
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        query = f"UPDATE collection_centers SET {', '.join(updates)} WHERE id = ?"
+        cursor.execute(query, tuple(params))
+        rows_affected = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return rows_affected > 0
+
+    def delete_collection_center(self, center_id):
+        """Soft delete collection center"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+                       UPDATE collection_centers SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+                       WHERE id = ?
+                       """, (center_id,))
+        rows_affected = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return rows_affected > 0

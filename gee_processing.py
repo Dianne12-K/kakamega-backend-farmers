@@ -3,6 +3,34 @@ from datetime import datetime, timedelta
 from config import Config
 
 class GEEProcessor:
+    # Add crop-specific thresholds
+    CROP_THRESHOLDS = {
+        'maize': {
+            'critical': 0.3,
+            'watch': 0.5,
+            'healthy': 0.65,
+            'optimal': 0.75
+        },
+        'sugarcane': {
+            'critical': 0.4,
+            'watch': 0.6,
+            'healthy': 0.75,
+            'optimal': 0.85
+        },
+        'beans': {
+            'critical': 0.25,
+            'watch': 0.45,
+            'healthy': 0.60,
+            'optimal': 0.70
+        },
+        'tea': {
+            'critical': 0.5,
+            'watch': 0.65,
+            'healthy': 0.78,
+            'optimal': 0.88
+        }
+    }
+
     def __init__(self):
         try:
             ee.Initialize(project=Config.GEE_PROJECT_ID)
@@ -124,31 +152,41 @@ class GEEProcessor:
             end_date.strftime('%Y-%m-%d')
         )
 
-    def calculate_health_score(self, ndvi_value):
+    def calculate_health_score(self, ndvi_value, crop_type='maize'):
         """
-        Convert NDVI to health score (0-100)
+        Convert NDVI to health score based on crop type
 
-        NDVI ranges:
-        - Bare soil/water: -1 to 0.2
-        - Sparse vegetation: 0.2 to 0.5
-        - Moderate vegetation: 0.5 to 0.7
-        - Dense healthy vegetation: 0.7 to 1.0
+        Args:
+            ndvi_value: NDVI value (-1 to 1)
+            crop_type: Type of crop ('maize', 'sugarcane', 'beans', 'tea')
+
+        Returns:
+            Health score (0-100)
         """
         if ndvi_value is None:
             return 0
 
-        # Normalize to 0-100 scale
-        if ndvi_value < 0.2:
-            score = 0
-        elif ndvi_value < 0.5:
-            # 0.2 to 0.5 → 20 to 50
-            score = 20 + ((ndvi_value - 0.2) / 0.3) * 30
-        elif ndvi_value < 0.7:
-            # 0.5 to 0.7 → 50 to 80
-            score = 50 + ((ndvi_value - 0.5) / 0.2) * 30
+        # Get crop-specific thresholds
+        thresholds = self.CROP_THRESHOLDS.get(crop_type.lower(), self.CROP_THRESHOLDS['maize'])
+
+        if ndvi_value < thresholds['critical']:
+            # Critical: 0-20
+            score = (ndvi_value / thresholds['critical']) * 20
+        elif ndvi_value < thresholds['watch']:
+            # Watch: 20-50
+            range_size = thresholds['watch'] - thresholds['critical']
+            normalized = (ndvi_value - thresholds['critical']) / range_size
+            score = 20 + (normalized * 30)
+        elif ndvi_value < thresholds['healthy']:
+            # Healthy: 50-80
+            range_size = thresholds['healthy'] - thresholds['watch']
+            normalized = (ndvi_value - thresholds['watch']) / range_size
+            score = 50 + (normalized * 30)
         else:
-            # 0.7 to 1.0 → 80 to 100
-            score = 80 + ((ndvi_value - 0.7) / 0.3) * 20
+            # Optimal: 80-100
+            range_size = thresholds['optimal'] - thresholds['healthy']
+            normalized = min(1.0, (ndvi_value - thresholds['healthy']) / range_size)
+            score = 80 + (normalized * 20)
 
         return int(min(100, max(0, score)))
 

@@ -1,11 +1,16 @@
+"""
+routes/ward_routes.py
+----------------------
+Ward endpoints — migrated to SQLAlchemy + PostGIS.
+"""
 from flask import Blueprint, request, jsonify
-from database import Database
+from extensions import db
+from core.models import Ward, Subcounty, Farm
 
-ward_bp = Blueprint('wards', __name__, url_prefix='/api')
-db = Database()
+ward_bp = Blueprint('wards', __name__)
 
 
-@ward_bp.route('/wards', methods=['GET', 'POST'])
+@ward_bp.route('/', methods=['GET', 'POST'])
 def wards():
     """
     Get All Wards or Create New Ward
@@ -16,12 +21,9 @@ def wards():
       - in: query
         name: subcounty_id
         type: integer
-        required: false
-        description: Filter wards by sub-county ID
+        description: Filter by sub-county
       - in: body
         name: body
-        required: false
-        description: Ward data for POST request
         schema:
           type: object
           properties:
@@ -33,97 +35,63 @@ def wards():
               example: 1
             code:
               type: string
-              example: BSE
             population:
               type: integer
-              example: 15000
             area_sq_km:
               type: number
-              example: 25.5
     responses:
       200:
         description: List of wards (GET)
       201:
         description: Ward created (POST)
     """
-
-    # =======================
-    # GET ALL WARDS
-    # =======================
     if request.method == 'GET':
         try:
             subcounty_id = request.args.get('subcounty_id', type=int)
-
+            query = Ward.query
             if subcounty_id:
-                wards = db.get_wards_by_subcounty(subcounty_id)
-            else:
-                wards = db.get_all_wards()
+                query = query.filter_by(subcounty_id=subcounty_id)
+            wards = query.order_by(Ward.name).all()
 
-            # Enrich with sub-county name
-            for ward in wards:
-                if ward.get('subcounty_id'):
-                    subcounty = db.get_subcounty(ward['subcounty_id'])
-                    ward['subcounty_name'] = subcounty['name'] if subcounty else None
+            result = []
+            for w in wards:
+                d = w.to_dict()
+                d['subcounty_name'] = w.subcounty.name if w.subcounty else None
+                d['farm_count']     = w.farms.count()
+                result.append(d)
 
-            return jsonify({
-                'success': True,
-                'count': len(wards),
-                'wards': wards
-            })
-
+            return jsonify({'success': True, 'count': len(result), 'wards': result})
         except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': str(e)
-            }), 500
+            return jsonify({'success': False, 'error': str(e)}), 500
 
-    # =======================
-    # CREATE WARD
-    # =======================
     elif request.method == 'POST':
         try:
-            data = request.json or {}
-
-            # Required fields validation
+            data = request.get_json() or {}
             if not data.get('name') or not data.get('subcounty_id'):
-                return jsonify({
-                    'success': False,
-                    'error': 'Missing required fields: name, subcounty_id'
-                }), 400
+                return jsonify({'success': False, 'error': 'Missing required: name, subcounty_id'}), 400
 
-            # Verify sub-county exists
-            subcounty = db.get_subcounty(data['subcounty_id'])
-            if not subcounty:
-                return jsonify({
-                    'success': False,
-                    'error': 'Sub-county not found'
-                }), 404
+            if not Subcounty.query.get(data['subcounty_id']):
+                return jsonify({'success': False, 'error': 'Sub-county not found'}), 404
 
-            ward_id = db.add_ward(
-                name=data['name'],
-                subcounty_id=data['subcounty_id'],
-                code=data.get('code', ''),
-                population=data.get('population', 0),
-                area_sq_km=data.get('area_sq_km', 0)
+            ward = Ward(
+                name         = data['name'],
+                subcounty_id = data['subcounty_id'],
+                code         = data.get('code', ''),
+                population   = data.get('population', 0),
+                area_sq_km   = data.get('area_sq_km', 0),
             )
-
-            return jsonify({
-                'success': True,
-                'ward_id': ward_id,
-                'message': 'Ward created successfully'
-            }), 201
-
+            db.session.add(ward)
+            db.session.commit()
+            return jsonify({'success': True, 'ward_id': ward.id, 'message': 'Ward created'}), 201
         except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': str(e)
-            }), 400
+            db.session.rollback()
+            return jsonify({'success': False, 'error': str(e)}), 400
 
 
-@ward_bp.route('/wards/<int:ward_id>', methods=['GET', 'PUT', 'DELETE'])
+@ward_bp.route('/<int:ward_id>', methods=['GET', 'PUT', 'DELETE'])
 def ward_detail(ward_id):
     """
-    Get, Update or Delete Ward
+    Get, Update or Delete a Ward
     ---
     tags:
       - Wards
@@ -132,147 +100,51 @@ def ward_detail(ward_id):
         in: path
         type: integer
         required: true
-      - in: body
-        name: body
-        required: false
-        description: Ward data for PUT request
-        schema:
-          type: object
-          properties:
-            name:
-              type: string
-            subcounty_id:
-              type: integer
-            code:
-              type: string
-            population:
-              type: integer
-            area_sq_km:
-              type: number
     responses:
       200:
-        description: Ward details or updated
-      204:
-        description: Ward deleted
+        description: Ward data or updated
       404:
         description: Ward not found
     """
+    ward = Ward.query.get(ward_id)
+    if not ward:
+        return jsonify({'success': False, 'error': 'Ward not found'}), 404
 
-    # =======================
-    # GET WARD
-    # =======================
     if request.method == 'GET':
         try:
-            ward = db.get_ward(ward_id)
-
-            if not ward:
-                return jsonify({
-                    'success': False,
-                    'error': 'Ward not found'
-                }), 404
-
-            # Get sub-county details
-            if ward.get('subcounty_id'):
-                subcounty = db.get_subcounty(ward['subcounty_id'])
-                ward['subcounty'] = subcounty
-
-            return jsonify({
-                'success': True,
-                'ward': ward
-            })
-
+            data = ward.to_dict()
+            data['subcounty']   = ward.subcounty.to_dict() if ward.subcounty else None
+            data['farm_count']  = ward.farms.count()
+            return jsonify({'success': True, 'ward': data})
         except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': str(e)
-            }), 500
+            return jsonify({'success': False, 'error': str(e)}), 500
 
-    # =======================
-    # UPDATE WARD
-    # =======================
     elif request.method == 'PUT':
         try:
-            # Check if exists
-            ward = db.get_ward(ward_id)
-            if not ward:
-                return jsonify({
-                    'success': False,
-                    'error': 'Ward not found'
-                }), 404
+            data = request.get_json() or {}
+            if 'subcounty_id' in data and not Subcounty.query.get(data['subcounty_id']):
+                return jsonify({'success': False, 'error': 'Sub-county not found'}), 404
 
-            data = request.json or {}
-
-            # If updating subcounty_id, verify it exists
-            if data.get('subcounty_id'):
-                subcounty = db.get_subcounty(data['subcounty_id'])
-                if not subcounty:
-                    return jsonify({
-                        'success': False,
-                        'error': 'Sub-county not found'
-                    }), 404
-
-            # Update ward
-            success = db.update_ward(
-                ward_id=ward_id,
-                name=data.get('name'),
-                subcounty_id=data.get('subcounty_id'),
-                code=data.get('code'),
-                population=data.get('population'),
-                area_sq_km=data.get('area_sq_km')
-            )
-
-            if success:
-                return jsonify({
-                    'success': True,
-                    'message': 'Ward updated successfully'
-                })
-            else:
-                return jsonify({
-                    'success': False,
-                    'error': 'Failed to update ward'
-                }), 400
-
+            for field in ['name', 'subcounty_id', 'code', 'population', 'area_sq_km']:
+                if field in data:
+                    setattr(ward, field, data[field])
+            db.session.commit()
+            return jsonify({'success': True, 'message': 'Ward updated', 'ward': ward.to_dict()})
         except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': str(e)
-            }), 400
+            db.session.rollback()
+            return jsonify({'success': False, 'error': str(e)}), 400
 
-    # =======================
-    # DELETE WARD
-    # =======================
     elif request.method == 'DELETE':
         try:
-            # Check if exists
-            ward = db.get_ward(ward_id)
-            if not ward:
-                return jsonify({
-                    'success': False,
-                    'error': 'Ward not found'
-                }), 404
-
-            # Delete ward
-            success = db.delete_ward(ward_id)
-
-            if success:
-                return jsonify({
-                    'success': True,
-                    'message': 'Ward deleted successfully'
-                }), 200
-            else:
-                return jsonify({
-                    'success': False,
-                    'error': 'Failed to delete ward'
-                }), 400
-
+            db.session.delete(ward)
+            db.session.commit()
+            return jsonify({'success': True, 'message': 'Ward deleted'})
         except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': str(e)
-            }), 500
+            db.session.rollback()
+            return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@ward_bp.route('/wards/<int:ward_id>/farms', methods=['GET'])
+@ward_bp.route('/<int:ward_id>/farms', methods=['GET'])
 def get_ward_farms(ward_id):
     """
     Get All Farms in a Ward
@@ -286,31 +158,46 @@ def get_ward_farms(ward_id):
         required: true
     responses:
       200:
-        description: List of farms in ward
+        description: Farms in this ward
       404:
         description: Ward not found
     """
-
     try:
-        # Check if ward exists
-        ward = db.get_ward(ward_id)
+        ward = Ward.query.get(ward_id)
         if not ward:
-            return jsonify({
-                'success': False,
-                'error': 'Ward not found'
-            }), 404
+            return jsonify({'success': False, 'error': 'Ward not found'}), 404
 
-        farms = db.get_farms_by_ward(ward_id)
-
+        farms = Farm.query.filter_by(ward_id=ward_id, status='active').all()
         return jsonify({
             'success': True,
-            'ward': ward['name'],
-            'count': len(farms),
-            'farms': farms
+            'ward':    ward.name,
+            'count':   len(farms),
+            'farms':   [f.to_dict() for f in farms]
         })
-
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@ward_bp.route('/<int:ward_id>/geojson', methods=['GET'])
+def ward_geojson(ward_id):
+    """
+    Get Ward as GeoJSON Feature
+    ---
+    tags:
+      - Wards
+    parameters:
+      - name: ward_id
+        in: path
+        type: integer
+        required: true
+    responses:
+      200:
+        description: GeoJSON Feature
+    """
+    try:
+        ward = Ward.query.get(ward_id)
+        if not ward:
+            return jsonify({'success': False, 'error': 'Ward not found'}), 404
+        return jsonify(ward.to_geojson())
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500

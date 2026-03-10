@@ -1,11 +1,64 @@
+"""
+routes/farm_routes.py
+----------------------
+Farm endpoints — migrated from SQLite + raw Database() class
+to SQLAlchemy + PostGIS models.
+"""
 from flask import Blueprint, request, jsonify
-from database import Database
+from datetime import datetime, timedelta
+from extensions import db
+from core.models import Farm, NDVIReading, MoistureReading, Recommendation
 
-farm_bp = Blueprint('farms', __name__, url_prefix='/api')
-db = Database()
+farm_bp = Blueprint('farms', __name__)
 
 
-@farm_bp.route('/farms', methods=['GET', 'POST'])
+# ── Helper ────────────────────────────────────────────────────────────────────
+
+def get_latest_ndvi(farm_id):
+    return (NDVIReading.query
+            .filter_by(farm_id=farm_id)
+            .order_by(NDVIReading.date.desc())
+            .first())
+
+def get_latest_moisture(farm_id):
+    return (MoistureReading.query
+            .filter_by(farm_id=farm_id)
+            .order_by(MoistureReading.date.desc())
+            .first())
+
+def get_latest_recommendation(farm_id):
+    return (Recommendation.query
+            .filter_by(farm_id=farm_id, is_resolved=False)
+            .order_by(Recommendation.created_at.desc())
+            .first())
+
+def enrich_farm(farm):
+    """Attach latest health, moisture to a farm dict."""
+    data = farm.to_dict()
+
+    ndvi = get_latest_ndvi(farm.id)
+    data['current_health'] = {
+        'score':    ndvi.health_score,
+        'status':   ndvi.status,
+        'ndvi':     float(ndvi.ndvi_value) if ndvi.ndvi_value else None,
+        'date':     str(ndvi.date),
+        'source':   ndvi.source,
+    } if ndvi else None
+
+    moisture = get_latest_moisture(farm.id)
+    data['current_moisture'] = {
+        'percent':        float(moisture.moisture_percent) if moisture.moisture_percent else None,
+        'status':         moisture.status,
+        'days_since_rain': moisture.days_since_rain,
+        'date':           str(moisture.date),
+    } if moisture else None
+
+    return data
+
+
+# ── GET /api/farms  &  POST /api/farms ───────────────────────────────────────
+
+@farm_bp.route('/', methods=['GET', 'POST'])
 def farms():
     """
     Get All Farms or Create New Farm
@@ -16,7 +69,6 @@ def farms():
       - in: body
         name: body
         required: false
-        description: Farm data for POST request
         schema:
           type: object
           properties:
@@ -39,8 +91,9 @@ def farms():
             longitude:
               type: number
               example: 34.7519
-            boundary_geojson:
-              type: object
+            ward_id:
+              type: integer
+              example: 1
     responses:
       200:
         description: List of farms (GET)
@@ -48,91 +101,84 @@ def farms():
         description: Farm created (POST)
     """
 
-    # =======================
-    # GET ALL FARMS
-    # =======================
+    # ── GET ALL FARMS ─────────────────────────────────────────
     if request.method == 'GET':
         try:
-            farms = db.get_all_farms()
+            # Optional filters from query string
+            crop_type = request.args.get('crop_type')
+            status    = request.args.get('status', 'active')
+            ward_id   = request.args.get('ward_id', type=int)
 
-            # Enrich farms with latest health & moisture data
-            for farm in farms:
-                farm_id = farm.get('id')
+            query = Farm.query
+            if status:
+                query = query.filter_by(status=status)
+            if crop_type:
+                query = query.filter_by(crop_type=crop_type)
+            if ward_id:
+                query = query.filter_by(ward_id=ward_id)
 
-                # Latest NDVI / health
-                ndvi_data = db.get_latest_ndvi(farm_id)
-                if ndvi_data:
-                    farm['current_health'] = {
-                        'score': ndvi_data.get('health_score'),
-                        'status': ndvi_data.get('status'),
-                        'ndvi': ndvi_data.get('ndvi_value'),
-                        'date': ndvi_data.get('date')
-                    }
-                else:
-                    farm['current_health'] = None
-
-                # Latest moisture
-                moisture_data = db.get_latest_moisture(farm_id)
-                if moisture_data:
-                    farm['current_moisture'] = {
-                        'percent': moisture_data.get('moisture_percent'),
-                        'status': moisture_data.get('status'),
-                        'days_since_rain': moisture_data.get('days_since_rain'),
-                        'date': moisture_data.get('date')
-                    }
-                else:
-                    farm['current_moisture'] = None
+            farms = query.order_by(Farm.created_at.desc()).all()
 
             return jsonify({
                 'success': True,
-                'count': len(farms),
-                'farms': farms
+                'count':   len(farms),
+                'farms':   [enrich_farm(f) for f in farms]
             })
 
         except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': str(e)
-            }), 500
+            return jsonify({'success': False, 'error': str(e)}), 500
 
-    # =======================
-    # CREATE FARM
-    # =======================
+    # ── CREATE FARM ───────────────────────────────────────────
     elif request.method == 'POST':
         try:
-            data = request.json or {}
+            data = request.get_json() or {}
 
-            # Required fields validation
             if not data.get('name') or not data.get('latitude') or not data.get('longitude'):
                 return jsonify({
                     'success': False,
                     'error': 'Missing required fields: name, latitude, longitude'
                 }), 400
 
-            farm_id = db.add_farm(
-                name=data['name'],
-                crop_type=data.get('crop_type', 'maize'),
-                planting_date=data.get('planting_date'),
-                area_ha=data.get('area_ha', 0),
-                lat=data['latitude'],
-                lon=data['longitude'],
-                boundary_geojson=data.get('boundary_geojson', {})
+            # Parse planting date if provided
+            planting_date = None
+            if data.get('planting_date'):
+                try:
+                    planting_date = datetime.strptime(data['planting_date'], '%Y-%m-%d').date()
+                except ValueError:
+                    return jsonify({'success': False, 'error': 'Invalid planting_date format. Use YYYY-MM-DD'}), 400
+
+            farm = Farm(
+                name                = data['name'],
+                crop_type           = data.get('crop_type', 'maize'),
+                planting_date       = planting_date,
+                area_ha             = data.get('area_ha', 0),
+                latitude            = data['latitude'],
+                longitude           = data['longitude'],
+                soil_type           = data.get('soil_type'),
+                irrigation          = data.get('irrigation'),
+                fertilizer_used     = data.get('fertilizer_used'),
+                status              = data.get('status', 'active'),
+                ward_id             = data.get('ward_id'),
             )
+
+            db.session.add(farm)
+            db.session.commit()
+            # Note: PostGIS trigger auto-sets farm.location from lat/lon
 
             return jsonify({
                 'success': True,
-                'farm_id': farm_id,
+                'farm_id': farm.id,
                 'message': 'Farm created successfully'
             }), 201
 
         except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': str(e)
-            }), 400
+            db.session.rollback()
+            return jsonify({'success': False, 'error': str(e)}), 400
 
 
-@farm_bp.route('/farms/<int:farm_id>', methods=['GET'])
+# ── GET /api/farms/<id> ───────────────────────────────────────────────────────
+
+@farm_bp.route('/<int:farm_id>', methods=['GET'])
 def get_farm(farm_id):
     """
     Get Farm Details
@@ -146,58 +192,181 @@ def get_farm(farm_id):
         required: true
     responses:
       200:
-        description: Farm details
+        description: Farm details with health, moisture, and NDVI history
       404:
         description: Farm not found
     """
-
     try:
-        farm = db.get_farm(farm_id)
-
+        farm = Farm.query.get(farm_id)
         if not farm:
-            return jsonify({
-                'success': False,
-                'error': 'Farm not found'
-            }), 404
+            return jsonify({'success': False, 'error': 'Farm not found'}), 404
 
-        # Latest data
-        latest_ndvi = db.get_latest_ndvi(farm_id)
-        latest_moisture = db.get_latest_moisture(farm_id)
-        latest_recommendation = db.get_recommendation(farm_id)
+        # NDVI history — last 90 days
+        since = datetime.utcnow().date() - timedelta(days=90)
+        ndvi_history = (NDVIReading.query
+                        .filter_by(farm_id=farm_id)
+                        .filter(NDVIReading.date >= since)
+                        .order_by(NDVIReading.date.asc())
+                        .all())
 
-        # Attach formatted current health
-        if latest_ndvi:
-            farm['current_health'] = {
-                'score': latest_ndvi.get('health_score'),
-                'status': latest_ndvi.get('status'),
-                'ndvi': latest_ndvi.get('ndvi_value'),
-                'date': latest_ndvi.get('date')
-            }
-        else:
-            farm['current_health'] = None
-
-        # Attach formatted current moisture
-        if latest_moisture:
-            farm['current_moisture'] = {
-                'percent': latest_moisture.get('moisture_percent'),
-                'status': latest_moisture.get('status'),
-                'days_since_rain': latest_moisture.get('days_since_rain'),
-                'date': latest_moisture.get('date')
-            }
-        else:
-            farm['current_moisture'] = None
+        latest_rec = get_latest_recommendation(farm_id)
 
         return jsonify({
-            'success': True,
-            'farm': farm,
-            'latest_health': latest_ndvi,
-            'latest_moisture': latest_moisture,
-            'latest_recommendation': latest_recommendation,
-            'ndvi_history': db.get_ndvi_history(farm_id, days=90)
+            'success':              True,
+            'farm':                 enrich_farm(farm),
+            'latest_health':        get_latest_ndvi(farm_id).to_dict() if get_latest_ndvi(farm_id) else None,
+            'latest_moisture':      get_latest_moisture(farm_id).to_dict() if get_latest_moisture(farm_id) else None,
+            'latest_recommendation': latest_rec.to_dict() if latest_rec else None,
+            'ndvi_history':         [n.to_dict() for n in ndvi_history],
         })
 
     except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ── PUT /api/farms/<id> ───────────────────────────────────────────────────────
+
+@farm_bp.route('/<int:farm_id>', methods=['PUT'])
+def update_farm(farm_id):
+    """
+    Update Farm Details
+    ---
+    tags:
+      - Farms
+    parameters:
+      - name: farm_id
+        in: path
+        type: integer
+        required: true
+      - in: body
+        name: body
+        schema:
+          type: object
+    responses:
+      200:
+        description: Farm updated
+      404:
+        description: Farm not found
+    """
+    try:
+        farm = Farm.query.get(farm_id)
+        if not farm:
+            return jsonify({'success': False, 'error': 'Farm not found'}), 404
+
+        data = request.get_json() or {}
+
+        # Update allowed fields
+        updatable = ['name', 'crop_type', 'area_ha', 'soil_type',
+                     'irrigation', 'fertilizer_used', 'status',
+                     'yield_estimate_tons', 'ward_id']
+        for field in updatable:
+            if field in data:
+                setattr(farm, field, data[field])
+
+        # Update coordinates — trigger will update geometry
+        if 'latitude' in data:
+            farm.latitude = data['latitude']
+        if 'longitude' in data:
+            farm.longitude = data['longitude']
+
+        if 'planting_date' in data and data['planting_date']:
+            farm.planting_date = datetime.strptime(data['planting_date'], '%Y-%m-%d').date()
+
+        db.session.commit()
+
         return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+            'success': True,
+            'message': 'Farm updated successfully',
+            'farm':    farm.to_dict()
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 400
+
+
+# ── DELETE /api/farms/<id> ────────────────────────────────────────────────────
+
+@farm_bp.route('/<int:farm_id>', methods=['DELETE'])
+def delete_farm(farm_id):
+    """
+    Delete a Farm
+    ---
+    tags:
+      - Farms
+    parameters:
+      - name: farm_id
+        in: path
+        type: integer
+        required: true
+    responses:
+      200:
+        description: Farm deleted
+      404:
+        description: Farm not found
+    """
+    try:
+        farm = Farm.query.get(farm_id)
+        if not farm:
+            return jsonify({'success': False, 'error': 'Farm not found'}), 404
+
+        db.session.delete(farm)
+        db.session.commit()
+
+        return jsonify({'success': True, 'message': f'Farm {farm_id} deleted'})
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ── GET /api/farms/<id>/geojson ───────────────────────────────────────────────
+
+@farm_bp.route('/<int:farm_id>/geojson', methods=['GET'])
+def get_farm_geojson(farm_id):
+    """
+    Get Farm as GeoJSON Feature
+    ---
+    tags:
+      - Farms
+    parameters:
+      - name: farm_id
+        in: path
+        type: integer
+        required: true
+    responses:
+      200:
+        description: GeoJSON Feature with farm geometry
+    """
+    try:
+        farm = Farm.query.get(farm_id)
+        if not farm:
+            return jsonify({'success': False, 'error': 'Farm not found'}), 404
+
+        return jsonify(farm.to_geojson())
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ── GET /api/farms/geojson (all farms as FeatureCollection) ──────────────────
+
+@farm_bp.route('/geojson', methods=['GET'])
+def farms_geojson():
+    """
+    Get All Farms as GeoJSON FeatureCollection
+    ---
+    tags:
+      - Farms
+    responses:
+      200:
+        description: GeoJSON FeatureCollection — use directly in Leaflet/OpenLayers
+    """
+    try:
+        farms = Farm.query.filter_by(status='active').all()
+        return jsonify({
+            'type':     'FeatureCollection',
+            'features': [f.to_geojson() for f in farms]
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
