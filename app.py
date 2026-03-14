@@ -8,7 +8,6 @@ from extensions import db, cors, SWAGGER_CONFIG, SWAGGER_TEMPLATE
 
 def create_app(env='development'):
     app = Flask(__name__)
-    app.url_map.strict_slashes = False
     app.config.from_object(config[env])
 
     # ── Init Extensions ───────────────────────────────────────
@@ -30,6 +29,8 @@ def create_app(env='development'):
     from routes.satellite_routes       import satellite_bp
     from routes.spatial_routes         import spatial_bp
     from routes.analytics_routes       import analytics_bp
+    from routes.ml_routes              import ml_bp
+    from routes.boundary_routes        import boundary_bp
 
     app.register_blueprint(health_bp)
     app.register_blueprint(farm_bp,           url_prefix='/api/farms')
@@ -41,10 +42,16 @@ def create_app(env='development'):
     app.register_blueprint(satellite_bp,      url_prefix='/api/satellite')
     app.register_blueprint(spatial_bp,        url_prefix='/api/spatial')
     app.register_blueprint(analytics_bp,      url_prefix='/api/analytics')
+    app.register_blueprint(ml_bp,             url_prefix='/api/ml')
+    app.register_blueprint(boundary_bp,       url_prefix='/api/boundaries')
 
     # ── Create DB Tables ──────────────────────────────────────
     with app.app_context():
         db.create_all()
+
+    # ── Boot ML models (load from disk or train) ──────────────
+    from ml.service import ml_service
+    ml_service.init_app(app)
 
     # ── Root ──────────────────────────────────────────────────
     @app.route('/')
@@ -65,6 +72,8 @@ def create_app(env='development'):
                 "satellite":       "/api/satellite",
                 "spatial":         "/api/spatial",
                 "analytics":       "/api/analytics",
+                "ml":              "/api/ml",
+                "boundaries":      "/api/boundaries",
                 "docs":            "/docs",
             }
         })
