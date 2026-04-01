@@ -2,11 +2,12 @@
 core/models.py
 --------------
 SQLAlchemy ORM models with PostGIS geometry support.
-Replaces the old raw SQL schema.py
 """
+import uuid as _uuid_mod
 from datetime import datetime
 from geoalchemy2 import Geometry
 from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from extensions import db
 
 
@@ -80,6 +81,35 @@ class Ward(TimestampMixin, db.Model):
         }
 
 
+# ── Map Layer ─────────────────────────────────────────────────────────────────
+
+class MapLayer(TimestampMixin, db.Model):
+    __tablename__ = 'map_layers'
+
+    id          = db.Column(db.Integer, primary_key=True)
+    uuid        = db.Column(UUID(as_uuid=True), default=_uuid_mod.uuid4, unique=True, nullable=False)
+    name        = db.Column(db.String(200), nullable=False)
+    color       = db.Column(db.String(20), default='#3b82f6')
+    visible     = db.Column(db.Boolean, default=True)
+    description = db.Column(db.String(500))
+    farm_count  = db.Column(db.Integer, default=0)
+
+    farms = db.relationship('Farm', backref='layer', lazy='dynamic',
+                            foreign_keys='Farm.layer_id')
+
+    def to_dict(self):
+        return {
+            'id':          self.id,
+            'uuid':        str(self.uuid) if self.uuid else None,
+            'name':        self.name,
+            'color':       self.color,
+            'visible':     self.visible,
+            'description': self.description,
+            'farm_count':  self.farms.count(),
+            'created_at':  self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 # ── Farm ──────────────────────────────────────────────────────────────────────
 
 class Farm(TimestampMixin, db.Model):
@@ -92,14 +122,19 @@ class Farm(TimestampMixin, db.Model):
     area_ha             = db.Column(db.Numeric(10, 4))
     latitude            = db.Column(db.Numeric(10, 7))
     longitude           = db.Column(db.Numeric(10, 7))
-    location            = db.Column(Geometry(geometry_type='POINT', srid=4326))    # auto-set by trigger
-    boundary            = db.Column(Geometry(geometry_type='POLYGON', srid=4326))  # farm boundary polygon
+    location            = db.Column(Geometry(geometry_type='POINT', srid=4326))
+    # Geometry type left as generic so both Polygon + MultiPolygon are accepted
+    boundary            = db.Column(Geometry(geometry_type='GEOMETRY', srid=4326))
     soil_type           = db.Column(db.String(100))
     irrigation          = db.Column(db.String(100))
     fertilizer_used     = db.Column(db.String(200))
     yield_estimate_tons = db.Column(db.Numeric(10, 4))
     status              = db.Column(db.String(50), default='active')
     ward_id             = db.Column(db.Integer, db.ForeignKey('wards.id'))
+    layer_id            = db.Column(db.Integer, db.ForeignKey('map_layers.id', ondelete='SET NULL'), nullable=True)
+
+    # Original attributes from the uploaded boundary file stored as-is
+    attributes          = db.Column(JSONB, default=dict)
 
     # Relationships
     ndvi_readings     = db.relationship('NDVIReading',     backref='farm', lazy='dynamic', cascade='all, delete-orphan')
@@ -122,15 +157,19 @@ class Farm(TimestampMixin, db.Model):
             'yield_estimate_tons': float(self.yield_estimate_tons) if self.yield_estimate_tons else None,
             'status':              self.status,
             'ward_id':             self.ward_id,
+            'layer_id':            self.layer_id,
+            'attributes':          self.attributes or {},
             'created_at':          self.created_at.isoformat() if self.created_at else None,
         }
 
     def to_geojson(self):
-        geom = self.boundary or self.location
+        geom  = self.boundary or self.location
+        props = self.to_dict()
+        props['has_boundary'] = self.boundary is not None
         return {
-            'type': 'Feature',
-            'geometry': db.session.scalar(func.ST_AsGeoJSON(geom)) if geom else None,
-            'properties': self.to_dict()
+            'type':     'Feature',
+            'geometry': __import__('json').loads(db.session.scalar(func.ST_AsGeoJSON(geom))) if geom else None,
+            'properties': props,
         }
 
 
@@ -224,10 +263,10 @@ class Recommendation(db.Model):
 
     id          = db.Column(db.Integer, primary_key=True)
     farm_id     = db.Column(db.Integer, db.ForeignKey('farms.id', ondelete='CASCADE'))
-    priority    = db.Column(db.String(20))   # high / medium / low
+    priority    = db.Column(db.String(20))
     action      = db.Column(db.Text, nullable=False)
     reason      = db.Column(db.Text)
-    category    = db.Column(db.String(50))   # irrigation / pest / fertilizer / harvest
+    category    = db.Column(db.String(50))
     is_resolved = db.Column(db.Boolean, default=False)
     created_at  = db.Column(db.DateTime(timezone=True), default=datetime.utcnow)
 
@@ -357,12 +396,12 @@ class SatelliteImagery(db.Model):
     id             = db.Column(db.Integer, primary_key=True)
     farm_id        = db.Column(db.Integer, db.ForeignKey('farms.id', ondelete='CASCADE'))
     date_acquired  = db.Column(db.Date, nullable=False)
-    satellite      = db.Column(db.String(50))   # sentinel-2, landsat-8, etc.
+    satellite      = db.Column(db.String(50))
     cloud_cover    = db.Column(db.Numeric(5, 2))
     ndvi           = db.Column(db.Numeric(6, 4))
     evi            = db.Column(db.Numeric(6, 4))
     moisture_index = db.Column(db.Numeric(6, 4))
-    raw_data       = db.Column(db.JSON)           # full GEE response
+    raw_data       = db.Column(db.JSON)
     created_at     = db.Column(db.DateTime(timezone=True), default=datetime.utcnow)
 
     def to_dict(self):

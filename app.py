@@ -31,6 +31,7 @@ def create_app(env='development'):
     from routes.analytics_routes       import analytics_bp
     from routes.ml_routes              import ml_bp
     from routes.boundary_routes        import boundary_bp
+    from routes.layer_routes           import layer_bp
 
     app.register_blueprint(health_bp)
     app.register_blueprint(farm_bp,           url_prefix='/api/farms')
@@ -44,6 +45,7 @@ def create_app(env='development'):
     app.register_blueprint(analytics_bp,      url_prefix='/api/analytics')
     app.register_blueprint(ml_bp,             url_prefix='/api/ml')
     app.register_blueprint(boundary_bp,       url_prefix='/api/boundaries')
+    app.register_blueprint(layer_bp,          url_prefix='/api/layers')
 
     # ── Create DB Tables ──────────────────────────────────────
     with app.app_context():
